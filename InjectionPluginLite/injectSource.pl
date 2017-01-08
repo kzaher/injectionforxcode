@@ -229,7 +229,9 @@ if ( !$learnt ) {
                             0 == system "time $line 2>&1"
                             or die "Interface compile failed";
                             print "!!Injection: Compile completes\n";
-                            ($nibCompiled) = $line =~ /-compilation-directory (.*?)\/\w+.lproj/;
+                            if ($line =~ /--compile\s+(\S.+)\/((?!\s)(?!\/).+)\.nib\s+/) {
+                                $nibCompiled = $1;
+                            }
                             $flags |= $INJECTION_STORYBOARD;
                             last FOUND;
                     }
@@ -565,3 +567,4 @@ system "touch $injectionCountFileName";
 my $injectionCount = (loadFile( $injectionCountFileName )||0) + 1;
 saveFile( $injectionCountFileName, $injectionCount );
 print "!!$injectionCount injections performed so far.\n";
+

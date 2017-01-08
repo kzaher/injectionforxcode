@@ -391,7 +391,7 @@ static NSString *kAppHome = @"http://injection.johnholdsworth.com/",
 //         "Make sure that text is selected and the cursor is inside the file you have edited."];
         return;
     }
-    else if ( [self.lastFile rangeOfString:@"\\.(mm?|swift|storyboard)$"
+    else if ( [self.lastFile rangeOfString:@"\\.(mm?|swift|storyboard|xib)$"
                                    options:NSRegularExpressionSearch].location == NSNotFound )
         [self.client alert:@"Only class implementations (.m, .mm, .swift or .storyboard files) can be injected."];
     else if ( [self.lastFile rangeOfString:@"/main\\.mm?$"

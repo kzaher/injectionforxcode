@@ -113,6 +113,17 @@ struct _in_header { int pathLength, dataLength; };
 @interface UINib(BundleInjection)
 - (NSArray *)inInstantiateWithOwner:(id)ownerOrNil options:(NSMutableDictionary *)optionsOrNil;
 @end
+
+@interface UINib (Name)
+
+    @property(nonatomic, copy) NSString *name;
+    + (UINib *)inNibWithNibName:(NSString *)name bundle:(nullable NSBundle *)bundleOrNil;
+@end
+
+@interface NSBundle(BundleInjection)
+    - (nullable NSArray *)inLoadNibNamed:(NSString *)name owner:(nullable id)owner options:(nullable NSDictionary *)options;
+@end
+
 #endif
 #if !TARGET_OS_TV
 @implementation UIAlertView(Injection)
@@ -201,7 +212,7 @@ id INColorDelegate;
 id INImageTarget;
 
 static char path[100000], *file = &path[1];
-static int status, sbInjection;
+static int status, sbInjection = 2;
 static int multicastSocket;
 static BOOL injectAndReset;
 
@@ -357,6 +368,8 @@ static NSNetService *service;
 
 static const char **addrPtr, *connectedAddress;
 
+#define LOAD_NIBS 1
+    
 + (const char *)connectedAddress {
     return connectedAddress;
 }
@@ -404,6 +417,25 @@ static const char **addrPtr, *connectedAddress;
 #endif
         size_t alen = strlen(arch)+1;
 
+#if LOAD_NIBS
+//#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && !defined(INJECTION_LOADER) && !defined(XPROBE_BUNDLE)
+ ///           if ( (sbInjection = status & INJECTION_STORYBOARD) ) {
+                method_exchangeImplementations(class_getInstanceMethod([UINib class], @selector(instantiateWithOwner:options:)),
+                                               class_getInstanceMethod([UINib class], @selector(inInstantiateWithOwner:options:)));
+                method_exchangeImplementations(class_getInstanceMethod(objc_getClass("UINibDecoder"), @selector(decodeObjectForKey:)),
+                                               class_getInstanceMethod([NSObject class], @selector(inDecodeObjectForKey:)));
+
+        method_exchangeImplementations(class_getInstanceMethod([NSBundle class], @selector(loadNibNamed:owner:options:)),
+                                               class_getInstanceMethod([NSBundle class], @selector(inLoadNibNamed:owner:options:)));
+
+        method_exchangeImplementations(class_getClassMethod([UINib class], @selector(nibWithNibName:bundle:)),
+                                       class_getClassMethod([UINib class], @selector(inNibWithNibName:bundle:))
+                                       );
+
+//            }
+//#endif
+#endif
+        
         int i;
         for ( i = 0 ; i < 3 ; i++ ) {
             int loaderSocket = 0;
@@ -426,6 +458,7 @@ static const char **addrPtr, *connectedAddress;
                 return;
             }
 
+            /*
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && !defined(INJECTION_LOADER) && !defined(XPROBE_BUNDLE)
             if ( (sbInjection = status & INJECTION_STORYBOARD) ) {
                 method_exchangeImplementations(class_getInstanceMethod([UINib class], @selector(instantiateWithOwner:options:)),
@@ -434,6 +467,7 @@ static const char **addrPtr, *connectedAddress;
                                                class_getInstanceMethod([NSObject class], @selector(inDecodeObjectForKey:)));
             }
 #endif
+             */
 
 #if TARGET_OS_IPHONE
             if ( status & INJECTION_DEVICEIOS8 ) {
@@ -975,7 +1009,7 @@ struct _in_objc_class { Class meta, supr; void *cache, *vtable; struct _in_objc_
 #endif
 
 + (void)autoLoadedNotify:(int)notify hook:(void *)hook {
-
+    notify = 2;
 #ifndef ANDROID
     __block BOOL seenInjectionClass = NO;
     Dl_info info;
@@ -1100,8 +1134,11 @@ struct _in_objc_class { Class meta, supr; void *cache, *vtable; struct _in_objc_
                                                                     object:injectedClasses];
             });
         });
-    else
+    else {
         NSLog( @"Injection Error: Could not locate referencesSection, are there any classes being injected?" );
+        [[NSNotificationCenter defaultCenter] postNotificationName:kINNotification
+                                                            object:injectedClasses];
+    }
 
     status = referencesSection != NULL;
 #endif
@@ -1113,6 +1150,8 @@ struct _in_objc_class { Class meta, supr; void *cache, *vtable; struct _in_objc_
 static NSMutableDictionary *optionsByVC, *placeholdersByNib;
 static NSMutableArray *recordPlaceholders, *playbackPlaceholders;
 static NSBundle *lastLoadedNibBundle;
+
+static NSMutableDictionary<NSString *, NSBundle *> *bundleByNib = nil;
 
 + (void)reloadVisibleVC:(UIViewController *)vc fromBundle:(NSBundle *)bundle storyBoard:(NSString *)storyBoard {
     if ( [vc respondsToSelector:@selector(visibleViewController)] )
@@ -1151,25 +1190,123 @@ static NSBundle *lastLoadedNibBundle;
     [vc viewDidAppear:NO];
 }
 
-+ (void)reloadNibs {
-    NSString *storyBoard = [NSBundle mainBundle].infoDictionary[@"UIMainStoryboardFile"];
-    lastLoadedNibBundle = [NSBundle bundleWithPath:[NSString stringWithUTF8String:path]];
+void registerBundle(NSBundle *bundle) {
+    bundleByNib = bundleByNib ?: [NSMutableDictionary dictionary];
 
-    UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-    NSArray *vcs = [rootVC isKindOfClass:[UISplitViewController class]] ?
-        [(UISplitViewController *)rootVC viewControllers] : [NSArray arrayWithObject:rootVC];
-    for ( UIViewController *vc in vcs )
-        [self reloadVisibleVC:vc fromBundle:lastLoadedNibBundle storyBoard:storyBoard];
+    NSArray *paths = [bundle pathsForResourcesOfType:@"nib" inDirectory:nil];
+
+    for (NSString *path in paths) {
+        NSString *nibName = path.lastPathComponent;
+        NSRange dotRange = [nibName rangeOfString:@"."];
+        if (dotRange.location == NSNotFound) {
+            continue;
+        }
+        NSString *name = [nibName substringToIndex:dotRange.location];
+        bundleByNib[name] = bundle;
+    }
+}
+
++ (void)reloadNibs {
+#if LOAD_NIBS
+    NSString *storyBoard = [NSBundle mainBundle].infoDictionary[@"UIMainStoryboardFile"];
+    int lastNumber = 0;
+    NSBundle *latest = nil;
+
+    for (NSBundle *test in [NSBundle allBundles]) {
+        NSString *lastPathComponent = test.bundlePath.lastPathComponent;
+
+        if (![lastPathComponent hasPrefix:@"InjectionBundle"]) {
+            continue;
+        }
+
+        NSRange dotRange = [lastPathComponent rangeOfString:@"."];
+        if (dotRange.location == NSNotFound) {
+            continue;
+        }
+
+        NSRange numberRange = NSMakeRange(@"InjectionBundle".length, dotRange.location - @"InjectionBundle".length);
+        NSString *numberString = [lastPathComponent substringWithRange:numberRange];
+
+        if ([numberString intValue] > lastNumber) {
+            lastNumber = [numberString intValue];
+            latest = test;
+        }
+    }
+    lastLoadedNibBundle = latest;
+
+    //dispatch_async(dispatch_get_main_queue(), ^() {
+        registerBundle(lastLoadedNibBundle);
+
+        /*
+        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+        NSArray *vcs = [rootVC isKindOfClass:[UISplitViewController class]] ?
+            [(UISplitViewController *)rootVC viewControllers] : [NSArray arrayWithObject:rootVC];
+        for ( UIViewController *vc in vcs )
+            [self reloadVisibleVC:vc fromBundle:lastLoadedNibBundle storyBoard:storyBoard];
+         */
+    //});
+#endif
 }
 
 @end
 
+    int UINib_name_key = 0;
+
+@implementation UINib (Name)
+    -(NSString*)name {
+        return (NSString *)objc_getAssociatedObject(self, &UINib_name_key);
+    }
+
+    -(void)setName:(NSString *)name {
+        objc_setAssociatedObject(self, &UINib_name_key, [name copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+@end
+
+@implementation NSBundle(BundleInjection)
+- (nullable NSArray *)inLoadNibNamed:(NSString *)name owner:(nullable id)owner options:(nullable NSDictionary *)options {
+    NSBundle *newestBundle = [bundleByNib objectForKey:name];
+
+    return [newestBundle ?: self inLoadNibNamed:name owner:owner options:options];
+}
+@end
+    
 @implementation UINib(BundleInjection)
 
-- (NSArray *)inInstantiateWithOwner:(id)ownerOrNil options:(NSMutableDictionary *)optionsOrNil {
-    NSString *nibName = [ownerOrNil respondsToSelector:@selector(nibName)] ? [ownerOrNil nibName] : nil;
-    //NSLog( @"inInstantiateWithOwner: %@", nibName );
++ (UINib *)inNibWithNibName:(NSString *)name bundle:(nullable NSBundle *)bundleOrNil {
+    UINib *nib = [self inNibWithNibName:name bundle:bundleOrNil];
 
+    nib.name = name;
+    
+    return nib;
+}
+
+- (NSArray *)inInstantiateWithOwner:(id)ownerOrNil options:(NSMutableDictionary *)optionsOrNil {
+    NSString *nibName = self.name;// [ownerOrNil respondsToSelector:@selector(nibName)] ? [ownerOrNil nibName] : nil;
+
+    if (nibName == nil) {
+        if ([ownerOrNil isKindOfClass:[UIViewController class]]) {
+            NSString *className = [[ownerOrNil class] description];
+            if ([className hasSuffix:@"Controller"]) {
+                nibName = [className substringToIndex:className.length - @"Controller".length];
+            }
+            else {
+                nibName = className;
+            }
+        }
+    }
+
+    NSLog( @"inInstantiateWithOwner: %@", nibName );
+    
+    NSBundle *newestBundle = [bundleByNib objectForKey:nibName];
+    UINib *newestNib = nil;
+
+    if (nibName.length > 0 && newestBundle) {
+        newestNib = [UINib nibWithNibName:nibName bundle:newestBundle];
+    }
+    
+    return [newestNib ?: self inInstantiateWithOwner:ownerOrNil options:optionsOrNil];
+    /*
+    
     UINib *nib = nil;
     if ( nibName && lastLoadedNibBundle && placeholdersByNib[nibName] ) {
         NSString *storyBoard = [NSBundle mainBundle].infoDictionary[@"UIMainStoryboardFile"];
@@ -1194,7 +1331,8 @@ static NSBundle *lastLoadedNibBundle;
 
     NSArray *topLevel = [nib ?: self inInstantiateWithOwner:ownerOrNil options:optionsOrNil];
     recordPlaceholders = playbackPlaceholders = nil;
-    return topLevel;
+     */
+    //return topLevel;
 }
 
 @end
